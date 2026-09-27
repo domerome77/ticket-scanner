@@ -25,15 +25,6 @@
   h1 { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
   .sub { font-size: 14px; color: #6b6d7a; margin-top: 4px; }
 
-  .tabs { display: flex; gap: 6px; background: #f1f0f5; border-radius: 14px; padding: 4px; margin-top: 1.25rem; }
-  .tab {
-    flex: 1; border: none; background: none; border-radius: 11px; padding: 10px 0;
-    font-size: 14px; font-weight: 700; color: #7a7c89; cursor: pointer;
-    display: flex; align-items: center; justify-content: center; gap: 6px;
-  }
-  .tab.active { background: #fff; color: #e21a63; box-shadow: 0 1px 3px rgba(20,21,31,0.12); }
-  .tab svg { width: 16px; height: 16px; }
-
   .dropzone {
     margin-top: 1.25rem;
     border: 1.5px solid #f6c6da;
@@ -151,14 +142,6 @@
   <div class="card">
     <h1>Find your transfer</h1>
     <p class="sub">We'll match it to your exact flight time</p>
-
-    <div class="tabs">
-      <button class="tab active" id="tabScan">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 8V5a2 2 0 0 1 2-2h3M21 8V5a2 2 0 0 1-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M21 16v3a2 2 0 0 1-2 2h-3" stroke-linecap="round"/></svg>
-        Scan ticket
-      </button>
-      <button class="tab" id="tabManual">🔍 Enter flight</button>
-    </div>
 
     <!-- UPLOAD STATE -->
     <div id="viewUpload">
@@ -363,10 +346,6 @@ document.getElementById('confirmBtn').addEventListener('click', () => {
   };
   alert('Confirmed flight details:\n\n' + JSON.stringify(result, null, 2));
 });
-document.getElementById('tabManual').addEventListener('click', () => {
-  alert('Manual flight entry is not part of this demo — use "Scan ticket" to upload or paste a screenshot.');
-});
-
 async function handleFile(file) {
   if (!file.type.startsWith('image/')) {
     showError('Please upload an image file (screenshot or photo of your ticket).');
