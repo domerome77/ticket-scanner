@@ -400,19 +400,52 @@ function fillResult(parsed, raw) {
 }
 
 // --- parsing heuristics ---
+// Calibrated against real boarding passes/e-tickets from Ryanair, Lufthansa,
+// Wizz Air, Turkish Airlines and easyJet — their route lines are formatted very
+// differently ("MUC — HRG", "DUB - LTN", "BUD W62205 LTN", "LTN ✈ ALC" with the
+// icon OCR just drops, "Damascus-İstanbul" with no code at all), so the parser
+// tries several strategies rather than one fixed pattern.
 const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
 const CODE_STOPWORDS = new Set([
   'THE','AND','FOR','YOU','ARE','NOT','BUT','ALL','CAN','HAS','WAS','ROW','VIA',
-  'ETC','PNR','SEQ','REF','ZONE','GATE','SEAT','FLT','ETK','UTC','AIR','USA'
+  'ETC','PNR','SEQ','REF','ZONE','GATE','SEAT','FLT','ETK','UTC','AIR','USA',
+  'EEA','EUR','USD','GBP'
 ]);
+
+// Brand wordmarks as they actually appear in OCR'd text (logos are sometimes
+// real text, not just images, on these boarding passes).
+const AIRLINE_BRANDS = [
+  { re: /ryanair/i, name: 'Ryanair' },
+  { re: /lufthansa/i, name: 'Lufthansa' },
+  { re: /wizz\s*air/i, name: 'Wizz Air' },
+  { re: /turkish\s*airlines?/i, name: 'Turkish Airlines' },
+  { re: /easy\s*jet/i, name: 'easyJet' },
+];
+// IATA carrier code -> airline, for when the flight number OCR'd but the
+// wordmark didn't (a stylized logo often isn't real text at all).
+const CARRIER_CODES = {
+  FR: 'Ryanair', LH: 'Lufthansa', W4: 'Wizz Air Malta', W6: 'Wizz Air',
+  TK: 'Turkish Airlines', U2: 'easyJet'
+};
 
 function parseBoardingPass(rawText) {
   const upper = rawText.toUpperCase();
+  const lines = rawText.split('\n');
 
-  // Airline name
+  // Airline: a real brand name beats a generic "___ Airways/Airlines" match,
+  // which beats inferring the carrier from the flight number alone.
   let airline = null;
-  const airlineMatch = upper.match(/([A-Z][A-Z.\s]{2,28}(?:AIRWAYS|AIRLINES|AVIATION|AIR))\b/);
-  if (airlineMatch) airline = toTitleCase(airlineMatch[1].trim());
+  const brand = AIRLINE_BRANDS.find(b => b.re.test(rawText));
+  if (brand) {
+    airline = brand.name;
+  } else {
+    const airlineMatch = upper.match(/([A-Z][A-Z.\s]{2,28}(?:AIRWAYS|AIRLINES|AVIATION|AIR))\b/);
+    if (airlineMatch) airline = toTitleCase(airlineMatch[1].trim());
+  }
+  if (!airline) {
+    const flightNo = rawText.match(/\b(FR|LH|W4|W6|TK|U2)\s?\d{2,4}\b/);
+    if (flightNo) airline = CARRIER_CODES[flightNo[1]];
+  }
 
   // Airport codes.
   // IMPORTANT: match against the ORIGINAL casing, not `upper`. Real boarding-pass
@@ -424,9 +457,12 @@ function parseBoardingPass(rawText) {
 
   let from = null, to = null;
 
-  // 1) Arrow/dash pattern on a single line: "Munich MUC — Hurghada HRG", "LJU -> AMS"
-  for (const line of rawText.split('\n')) {
-    if (!/[—–\-→]/.test(line)) continue;
+  // 1) Two real codes on the same line is the strongest signal on its own — no
+  // separator is required, since several airlines put nothing but whitespace (or
+  // an icon OCR drops entirely) between the two codes: "MUC — HRG" (Lufthansa),
+  // "DUB - LTN" (Ryanair), "BUD W62205 LTN" (Wizz, codes flank the flight number),
+  // "LTN ALC" (easyJet, was "LTN ✈ ALC" before the plane icon vanished in OCR).
+  for (const line of lines) {
     const codes = codesIn(line);
     if (codes.length >= 2) { from = codes[0]; to = codes[1]; break; }
   }
@@ -440,21 +476,34 @@ function parseBoardingPass(rawText) {
     if (!to && toLabel) to = toLabel[1];
   }
 
-  // 3) Last resort: any two distinct genuinely-uppercase 3-letter tokens anywhere
+  // 3) Any two distinct genuinely-uppercase 3-letter tokens anywhere
   if (!from || !to) {
     const uniq = [...new Set(codesIn(rawText))];
     if (!from && uniq[0]) from = uniq[0];
     if (!to) { const cand = uniq.find(c => c !== from); if (cand) to = cand; }
   }
 
-  // Date: "15 JUL 2026" / "2026-07-15" / "15/07/2026"
+  // 4) Some e-tickets (Turkish Airlines confirmation emails, for example) never
+  // print a 3-letter code at all — just "Damascus-İstanbul" on its own line.
+  // Fall back to that city pair when no code was found anywhere above.
+  if (!from || !to) {
+    const cityWord = "[A-ZÀ-ÿİ][a-zà-ÿı']+(?:[ .][A-ZÀ-ÿİa-zà-ÿı']+){0,2}";
+    const cityLine = new RegExp(`^(${cityWord})\\s*-\\s*(${cityWord})$`);
+    for (const raw of lines) {
+      const m = raw.trim().match(cityLine);
+      if (m) { from = from || m[1]; to = to || m[2]; break; }
+    }
+  }
+
+  // Date: "15 JUL 2026" / "24. Oct 2017" (Ryanair's trailing dot) / "2026-07-15" /
+  // "15/07/2026" / "13 Aug" with no year at all (Wizz Air) — default to this year.
   let date = null;
-  const monthNameMatch = upper.match(/\b(\d{1,2})\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})\b/);
+  const monthNameMatch = upper.match(/\b(\d{1,2})[.,]?\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})?\b/);
   const isoMatch = upper.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
   const numericMatch = upper.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
   if (monthNameMatch) {
     const day = monthNameMatch[1].padStart(2, '0');
-    const year = normalizeYear(monthNameMatch[3]);
+    const year = monthNameMatch[3] ? normalizeYear(monthNameMatch[3]) : String(new Date().getFullYear());
     date = `${day} ${monthNameMatch[2]} ${year}`;
   } else if (isoMatch) {
     const [, y, m, d] = isoMatch;
@@ -469,14 +518,27 @@ function parseBoardingPass(rawText) {
     date = `${day.padStart(2, '0')} ${MONTHS[mi] || month} ${y}`;
   }
 
-  // Time near "DEPART"/"BOARDING" keywords, else first HH:MM found
+  // Departure time. Boarding passes print this as a table — a header row
+  // ("Date / Gate Closes / Departs" or "Date / Boarding / Departs") followed by
+  // a value row — so the label nearest the value we want is rarely adjacent to
+  // it in the flattened OCR text. Two shapes cover every airline here:
+  //   - headers BEFORE values (Ryanair, Wizz Air, easyJet): the value we want is
+  //     the LAST time near the "Depart"/"Gate Closes" label, since Boarding or
+  //     Gate-Closes time is always printed/listed first.
+  //   - values BEFORE headers (this app's own Lufthansa-style confirmations):
+  //     the FIRST time in the whole text is already the departure time.
   let departs = null;
-  const nearDepart = upper.match(/DEPART[A-Z]*\s*[:\-]?\s*(\d{1,2}:\d{2})/);
-  const nearBoarding = upper.match(/BOARDING[A-Z]*\s*[:\-]?\s*(\d{1,2}:\d{2})/);
-  const anyTime = upper.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-  if (nearDepart) departs = nearDepart[1];
-  else if (anyTime) departs = `${anyTime[1].padStart(2, '0')}:${anyTime[2]}`;
-  else if (nearBoarding) departs = nearBoarding[1];
+  const allTimes = [...upper.matchAll(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g)];
+  const departIdx = upper.search(/DEPART[A-Z]*|GATE\s*CLOSES?/);
+  if (allTimes.length) {
+    if (departIdx !== -1 && departIdx < allTimes[0].index) {
+      const nearby = allTimes.filter(t => t.index >= departIdx && t.index < departIdx + 120);
+      const pick = nearby.length ? nearby[nearby.length - 1] : allTimes[0];
+      departs = `${pick[1].padStart(2, '0')}:${pick[2]}`;
+    } else {
+      departs = `${allTimes[0][1].padStart(2, '0')}:${allTimes[0][2]}`;
+    }
+  }
 
   return { airline, from, to, date, departs };
 }
