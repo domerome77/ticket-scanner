@@ -225,6 +225,7 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.4/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <script>
 const viewUpload = document.getElementById('viewUpload');
 const viewProcessing = document.getElementById('viewProcessing');
@@ -356,8 +357,23 @@ async function handleFile(file) {
   thumb.src = dataUrl;
   showView('processing');
   procBar.style.width = '0%';
-  procSub.textContent = 'This takes a few seconds';
+  procSub.textContent = 'Looking for a QR or barcode…';
 
+  // QR/barcode first: a real boarding pass's code encodes exact structured data
+  // (the IATA BCBP standard nearly every airline uses), which beats guessing from
+  // OCR text whenever it's there. It never carries a time-of-day, though, so OCR
+  // still runs afterward regardless — this is the "fallback" for whatever the
+  // code doesn't cover, including entirely when there's no code to read at all.
+  let qrRaw = null;
+  let bcbp = null;
+  try {
+    qrRaw = await tryDecodeQR(dataUrl);
+    if (qrRaw) bcbp = parseBCBP(qrRaw);
+  } catch (e) {
+    console.warn('QR decode failed', e);
+  }
+
+  procSub.textContent = bcbp ? 'Confirming with ticket text…' : 'Reading text…';
   try {
     const { data } = await Tesseract.recognize(dataUrl, 'eng', {
       logger: m => {
@@ -369,8 +385,15 @@ async function handleFile(file) {
         }
       }
     });
-    const parsed = parseBoardingPass(data.text || '');
-    fillResult(parsed, data.text || '');
+    const ocr = parseBoardingPass(data.text || '');
+    const merged = {
+      airline: (bcbp && CARRIER_CODES[bcbp.carrier]) || ocr.airline,
+      from: (bcbp && bcbp.from) || ocr.from,
+      to: (bcbp && bcbp.to) || ocr.to,
+      date: (bcbp && julianToDate(bcbp.julianDay)) || ocr.date,
+      departs: ocr.departs, // BCBP has no time-of-day field, always comes from OCR
+    };
+    fillResult(merged, data.text || '', qrRaw, bcbp);
     showView('result');
   } catch (err) {
     console.error(err);
@@ -388,14 +411,72 @@ function fileToDataUrl(file) {
   });
 }
 
-function fillResult(parsed, raw) {
+// --- QR / barcode: decode, then parse as IATA BCBP if it looks like one ---
+function tryDecodeQR(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, imageData.width, imageData.height, { inversionAttempts: 'attemptBoth' });
+        resolve(code ? code.data : null);
+      } catch (e) { reject(e); }
+    };
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+
+// IATA Bar Coded Boarding Pass (BCBP) "M" format — the fixed-width string nearly
+// every airline's boarding-pass barcode/QR encodes. Mandatory portion is a rigid
+// 60 characters; see IATA's BCBP Implementation Guide for the full field layout.
+function parseBCBP(raw) {
+  if (!raw || raw.length < 60 || raw[0] !== 'M') return null;
+  const from = raw.slice(30, 33).trim();
+  const to = raw.slice(33, 36).trim();
+  const carrier = raw.slice(36, 39).trim();
+  const julian = raw.slice(44, 47);
+  if (!/^[A-Z]{3}$/.test(from) || !/^[A-Z]{3}$/.test(to)) return null;
+  const julianDay = parseInt(julian, 10);
+  if (!julianDay || julianDay < 1 || julianDay > 366) return null;
+  return {
+    name: raw.slice(2, 22).trim(),
+    pnr: raw.slice(23, 30).trim(),
+    from, to, carrier,
+    flightNo: raw.slice(39, 44).trim(),
+    julianDay,
+  };
+}
+
+// BCBP has no year — pick whichever year lands closest to today, since a boarding
+// pass is issued for a flight that's either about to happen or just happened.
+function julianToDate(julianDay) {
+  const now = new Date();
+  let d = new Date(Date.UTC(now.getFullYear(), 0, julianDay));
+  if ((d - now) / 86400000 < -200) d = new Date(Date.UTC(now.getFullYear() + 1, 0, julianDay));
+  else if ((d - now) / 86400000 > 200) d = new Date(Date.UTC(now.getFullYear() - 1, 0, julianDay));
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${day} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+}
+
+function fillResult(parsed, raw, qrRaw, bcbp) {
   document.getElementById('passEyebrow').textContent = `${parsed.airline || 'Unknown Airline'} · Boarding pass`;
   document.getElementById('fAirline').textContent = parsed.airline || 'Unknown Airline';
   document.getElementById('fFrom').textContent = parsed.from || '???';
   document.getElementById('fTo').textContent = parsed.to || '???';
   document.getElementById('fDate').textContent = parsed.date || '—';
   document.getElementById('fTime').textContent = parsed.departs || '—';
-  rawText.textContent = raw.trim() || '(no text detected)';
+  const qrSection = bcbp
+    ? `QR/barcode decoded (IATA BCBP): ${qrRaw}\nParsed: ${JSON.stringify(bcbp)}\n\n`
+    : qrRaw
+      ? `QR/barcode decoded, but not a recognizable boarding-pass code: ${qrRaw}\n\n`
+      : 'No QR/barcode found in the image.\n\n';
+  rawText.textContent = qrSection + (raw.trim() || '(no OCR text detected)');
   rawText.style.display = 'none';
 }
 
