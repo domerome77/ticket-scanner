@@ -495,12 +495,45 @@ function parseBoardingPass(rawText) {
     }
   }
 
+  // Date and departure time both live in the same kind of table: a header row
+  // ("Depart | Gate Closes | Date" or "Date   Gate Closes   Departs") immediately
+  // followed by a value row ("08:30 | 08:00 | 28 Sep" / "24. Oct 2017  07:45  08:15")
+  // — this lets us match each value to its header by column position instead of
+  // by proximity, which breaks here: "Depart" isn't always the last header, so
+  // "the time nearest the Depart label" is sometimes the wrong neighboring column.
+  // The value row's columns come back either "|"-divided or lined up with 2+
+  // spaces where a divider/gap was in the original image — try both.
+  const HEADER_FIELDS = [
+    { re: /\bDEPART[A-Z]*\b/, key: 'depart' },
+    { re: /\bGATE\s*CLOSES?\b/, key: 'gateCloses' },
+    { re: /\bBOARDING\b/, key: 'boarding' },
+    { re: /\bDATE\b/, key: 'date' },
+    { re: /\bARRIVAL\b/, key: 'arrival' },
+  ];
+  let tableRow = null;
+  for (let i = 0; i < lines.length - 1; i++) {
+    const headerLine = lines[i].toUpperCase();
+    const found = HEADER_FIELDS
+      .map(h => ({ key: h.key, index: headerLine.search(h.re) }))
+      .filter(h => h.index !== -1)
+      .sort((a, b) => a.index - b.index);
+    if (found.length < 2) continue;
+    const valueLine = lines[i + 1];
+    const values = (valueLine.includes('|') ? valueLine.split('|') : valueLine.split(/\s{2,}/))
+      .map(s => s.trim()).filter(Boolean);
+    if (values.length < found.length) continue;
+    tableRow = {};
+    found.forEach((f, idx) => { tableRow[f.key] = values[idx]; });
+    break;
+  }
+
   // Date: "15 JUL 2026" / "24. Oct 2017" (Ryanair's trailing dot) / "2026-07-15" /
-  // "15/07/2026" / "13 Aug" with no year at all (Wizz Air) — default to this year.
+  // "15/07/2026" / "28 Sep" or "13 Aug" with no year at all — default to this year.
   let date = null;
-  const monthNameMatch = upper.match(/\b(\d{1,2})[.,]?\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})?\b/);
-  const isoMatch = upper.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  const numericMatch = upper.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
+  const dateSource = (tableRow && tableRow.date) ? tableRow.date.toUpperCase() : upper;
+  const monthNameMatch = dateSource.match(/\b(\d{1,2})[.,]?\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})?\b/);
+  const isoMatch = dateSource.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  const numericMatch = dateSource.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
   if (monthNameMatch) {
     const day = monthNameMatch[1].padStart(2, '0');
     const year = monthNameMatch[3] ? normalizeYear(monthNameMatch[3]) : String(new Date().getFullYear());
@@ -518,25 +551,20 @@ function parseBoardingPass(rawText) {
     date = `${day.padStart(2, '0')} ${MONTHS[mi] || month} ${y}`;
   }
 
-  // Departure time. Boarding passes print this as a table — a header row
-  // ("Date / Gate Closes / Departs" or "Date / Boarding / Departs") followed by
-  // a value row — so the label nearest the value we want is rarely adjacent to
-  // it in the flattened OCR text. Two shapes cover every airline here:
-  //   - headers BEFORE values (Ryanair, Wizz Air, easyJet): the value we want is
-  //     the LAST time near the "Depart"/"Gate Closes" label, since Boarding or
-  //     Gate-Closes time is always printed/listed first.
-  //   - values BEFORE headers (this app's own Lufthansa-style confirmations):
-  //     the FIRST time in the whole text is already the departure time.
+  // Departure time: prefer the table row's own "depart" column when we found one
+  // (exact, no guessing). Otherwise fall back to scanning for any HH:MM, skipping
+  // lines that look like a phone status bar ("4G 19:22 67%") — that clock reads
+  // as a perfectly valid time and, sitting right at the top of the OCR text, would
+  // otherwise get mistaken for the flight's departure time.
   let departs = null;
-  const allTimes = [...upper.matchAll(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g)];
-  const departIdx = upper.search(/DEPART[A-Z]*|GATE\s*CLOSES?/);
-  if (allTimes.length) {
-    if (departIdx !== -1 && departIdx < allTimes[0].index) {
-      const nearby = allTimes.filter(t => t.index >= departIdx && t.index < departIdx + 120);
-      const pick = nearby.length ? nearby[nearby.length - 1] : allTimes[0];
-      departs = `${pick[1].padStart(2, '0')}:${pick[2]}`;
-    } else {
-      departs = `${allTimes[0][1].padStart(2, '0')}:${allTimes[0][2]}`;
+  const timeInValue = v => { const m = v && v.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/); return m ? `${m[1].padStart(2, '0')}:${m[2]}` : null; };
+  if (tableRow) departs = timeInValue(tableRow.depart) || timeInValue(tableRow.gateCloses);
+  if (!departs) {
+    const looksLikeStatusBar = line => /%\)|%\s*$|\b\d\s?G\b|\bLTE\b|\bWI-?FI\b/i.test(line);
+    for (const line of lines) {
+      if (looksLikeStatusBar(line)) continue;
+      const t = timeInValue(line.toUpperCase());
+      if (t) { departs = t; break; }
     }
   }
 
