@@ -543,9 +543,14 @@ function parseBoardingPass(rawText) {
   // an icon OCR drops entirely) between the two codes: "MUC — HRG" (Lufthansa),
   // "DUB - LTN" (Ryanair), "BUD W62205 LTN" (Wizz, codes flank the flight number),
   // "LTN ALC" (easyJet, was "LTN ✈ ALC" before the plane icon vanished in OCR).
+  // Reject an identical pair and keep looking: a flight never departs and lands
+  // at the same airport, so that's a false match — e.g. a round-trip summary's
+  // "ZAG - Malta | Malta - ZAG" row reads as codes ["ZAG","ZAG"] (only one side
+  // of that particular row used a real code; the airport actually shared by both
+  // legs collided with itself), while a later row spells out both ends properly.
   for (const line of lines) {
     const codes = codesIn(line);
-    if (codes.length >= 2) { from = codes[0]; to = codes[1]; break; }
+    if (codes.length >= 2 && codes[0] !== codes[1]) { from = codes[0]; to = codes[1]; break; }
   }
 
   // 2) Explicit "FROM ... TO ..." labels (only real if the label itself is capitalized,
@@ -611,15 +616,34 @@ function parseBoardingPass(rawText) {
   // Date: "15 JUL 2026" / "24. Oct 2017" (Ryanair's trailing dot) / "2026-07-15" /
   // "15/07/2026" / "28 Sep" or "13 Aug" with no year at all — default to this year.
   let date = null;
-  const dateSource = (tableRow && tableRow.date) ? tableRow.date.toUpperCase() : upper;
-  const monthNameMatch = dateSource.match(/\b(\d{1,2})[.,]?\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})?\b/);
-  const isoMatch = dateSource.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  const numericMatch = dateSource.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
-  if (monthNameMatch) {
-    const day = monthNameMatch[1].padStart(2, '0');
-    const year = monthNameMatch[3] ? normalizeYear(monthNameMatch[3]) : String(new Date().getFullYear());
-    date = `${day} ${monthNameMatch[2]} ${year}`;
-  } else if (isoMatch) {
+  if (tableRow && tableRow.date) {
+    const mm = tableRow.date.toUpperCase().match(/\b(\d{1,2})[.,]?\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})?\b/);
+    if (mm) {
+      const day = mm[1].padStart(2, '0');
+      const year = mm[3] ? normalizeYear(mm[3]) : String(new Date().getFullYear());
+      date = `${day} ${mm[2]} ${year}`;
+    }
+  }
+  // A round-trip itinerary prints two (or more) dates — always prefer the
+  // EARLIEST one, the traveller's actual departure, over a later return date,
+  // regardless of which one happens to read first in the OCR text (that follows
+  // the page's column layout, not flight order).
+  if (!date) {
+    const monthMatches = [...upper.matchAll(/\b(\d{1,2})[.,]?\s?(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[A-Z]*\s?(\d{2,4})?\b/g)]
+      .map(m => {
+        const day = parseInt(m[1], 10);
+        const mi = MONTHS.indexOf(m[2]);
+        const year = m[3] ? parseInt(normalizeYear(m[3]), 10) : new Date().getFullYear();
+        return { value: year * 10000 + mi * 100 + day, text: `${String(day).padStart(2, '0')} ${m[2]} ${year}` };
+      });
+    if (monthMatches.length) {
+      monthMatches.sort((a, b) => a.value - b.value);
+      date = monthMatches[0].text;
+    }
+  }
+  const isoMatch = date ? null : upper.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  const numericMatch = date ? null : upper.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
+  if (isoMatch) {
     const [, y, m, d] = isoMatch;
     date = `${d} ${MONTHS[parseInt(m, 10) - 1] || m} ${y}`;
   } else if (numericMatch) {
